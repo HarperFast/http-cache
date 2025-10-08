@@ -20,7 +20,7 @@
 		"type": "git",
 		"url": "git+https://github.com/HarperDB/http-cache.git"
 	},
-	"license": "MIT",
+	"license": "Apache-2.0",
 	"scripts": {
 		"format": "prettier --write ."
 	},
