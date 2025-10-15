@@ -1,7 +1,6 @@
 const { Readable } = require('node:stream');
 const { createBrotliCompress, brotliDecompress, constants } = require('zlib');
 const crypto = require('crypto');
-const { HttpCache } = databases.cache;
 /**
  * Setup the caching middleware
  */
@@ -13,24 +12,71 @@ const KEY_OVERFLOW = 1000;
 const DEFAULT_CLEAR_REST_INTERVAL_COUNT = 50;
 const DEFAULT_CLEAR_REST_INTERVAL_MS = 10;
 
-const newBlob = async (content) => {
+const DEFAULT_CACHE_DB_NAME = 'cache';
+
+const newBlob = async (content, cacheTable) => {
 	const blob = await createBlob(content);
-	await blob.save(HttpCache);
+	await blob.save(cacheTable);
 	return blob;
+};
+
+const ensureDatabases = async (groups) => {
+	logger.info(`Using additional cache database groups: ${groups.join(', ')}`);
+	for (const cacheGroupDb of groups) {
+		if (!databases[cacheGroupDb]) {
+			logger.warn(`Cache db ${cacheGroupDb} doesn't exsist. Creating...`);
+			await server.operation({ operation: 'create_database', database: cacheGroupDb });
+		}
+		if (!databases[cacheGroupDb].HttpCache) {
+			logger.warn(`Cache table in ${cacheGroupDb} db doesn't exsist. Creating...`);
+			await server.operation({
+				operation: 'create_table',
+				database: cacheGroupDb,
+				table: 'HttpCache',
+				primary_key: 'id',
+				expiration: 86400,
+				attributes: [
+					{
+						name: 'expiresSWRAt',
+						type: 'Float',
+					},
+					{
+						name: 'headers',
+						type: 'Any',
+					},
+					{
+						name: 'content',
+						type: 'Bytes',
+					},
+				],
+			});
+		}
+	}
 };
 
 /**
  * This is the handler that is used to cache the response. It is defined and exported so other middleware can directly
  * use it and set a cacheKey or bypass the cache
  */
-exports.getCacheHandler = function (options) {
+exports.getCacheHandler = async function (options) {
+	if (server.workerIndex === 0 && options?.additionalCacheDatabaseGroups?.length) {
+		await ensureDatabases(options.additionalCacheDatabaseGroups);
+	}
+
+	setCacheSource(options?.additionalCacheDatabaseGroups ?? []);
+
 	return async (request, nextHandler) => {
-		if (request.pathname === '/invalidate') {
+		// matches path /invalidate or /invalidate/*
+		if (/^\/invalidate(\/.*)?$/.test(request.pathname)) {
 			if (!request.user?.role.permission.super_user) {
 				let error = new Error('Unauthorized');
 				error.statusCode = 401;
 				throw error;
 			}
+
+			const cacheGroup = str.split('/invalidate/')?.[1] ?? DEFAULT_CACHE_DB_NAME;
+			const cacheTable = databases[cacheGroup].HttpCache;
+
 			// invalidate the cache
 			let last;
 			let count = 0;
@@ -40,12 +86,12 @@ exports.getCacheHandler = function (options) {
 				const clearRestIntervalCount = options.clearRestIntervalCount ?? DEFAULT_CLEAR_REST_INTERVAL_COUNT;
 				const clearRestIntervalMs = options.clearRestIntervalMs ?? DEFAULT_CLEAR_REST_INTERVAL_MS;
 				// do this before entering the async function in case it throws
-				const searchResults = HttpCache.search(query, { onlyIfCached: true, noCacheStore: true });
+				const searchResults = cacheTable.search(query, { onlyIfCached: true, noCacheStore: true });
 				let finished, lastKey;
 				(async () => {
 					for await (let entry of searchResults) {
 						lastKey = entry.id;
-						last = HttpCache.delete(entry.id); // no context/transaction, should be non-transactional/incremental
+						last = cacheTable.delete(entry.id); // no context/transaction, should be non-transactional/incremental
 						if (count++ % clearRestIntervalCount === 0) {
 							await last;
 							if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
@@ -67,7 +113,7 @@ exports.getCacheHandler = function (options) {
 				};
 			} else if (request.method === 'GET') {
 				let keyStart = new URLSearchParams(query.url).get('key');
-				let searchResults = HttpCache.primaryStore.getRange({
+				let searchResults = cacheTable.primaryStore.getRange({
 					start: keyStart ?? ' ',
 					versions: true,
 					limit: 10,
@@ -88,6 +134,8 @@ exports.getCacheHandler = function (options) {
 		}
 		// check if the request is cacheable
 		if (request.method === 'GET') {
+			const cacheTable = databases[request.cacheGroup]?.HttpCache ?? databases.cache.HttpCache;
+
 			// assign the nextHandler so it can be used within the cache resolver
 			request.cacheNextHandler = nextHandler;
 			let startTime = performance.now();
@@ -112,7 +160,8 @@ exports.getCacheHandler = function (options) {
 				cacheKey = cacheKey.slice(0, KEY_OVERFLOW) + ':' + crypto.createHash('md5').update(cacheKey).digest('hex');
 			}
 			// use our cache table, using the cacheKey if provided, otherwise use the URL/path
-			let response = await HttpCacheWithSWR.get(cacheKey, request);
+			const cacheWithSWR = server.resources.get(`${request.cacheGroup ?? DEFAULT_CACHE_DB_NAME}WithSWR`).Resource;
+			let response = await cacheWithSWR.get(cacheKey, request);
 			// if it is a cache miss, we let the handler actually directly write to the node response object
 			// and stream the results to the client, so we don't need to return anything here
 			if (!request._nodeResponse.writableEnded) {
@@ -136,7 +185,7 @@ exports.getCacheHandler = function (options) {
 							body = await body.bytes();
 						} catch (_e) {
 							try {
-								await HttpCache.delete(cacheKey); // if we can't read the blob, delete it from the cache
+								await cacheTable.delete(cacheKey); // if we can't read the blob, delete it from the cache
 							} finally {
 								return nextHandler(request);
 							}
@@ -180,168 +229,183 @@ exports.getCacheHandler = function (options) {
  * Source the Next.js cache from request resolution using the passed in Next.js request handler,
  * and intercepting the response to cache it.
  */
-HttpCache.sourcedFrom({
-	async get(path, context) {
-		const request = context.requestContext;
-		if (request.maxAgeSeconds) context.expiresAt = request.maxAgeSeconds * 1000 + Date.now();
-		let expiresSWRAt;
-		if (request.staleWhileRevalidateSeconds) {
-			// this is the time at which the response can be served stale while revalidating, after the main expiresAt time
-			expiresSWRAt = request.staleWhileRevalidateSeconds * 1000 + (context.expiresAt ?? Date.now());
-		}
-		return new Promise((resolve, reject) => {
-			const nodeResponse = request._nodeResponse;
-			if (!nodeResponse) return;
-			// intercept the main methods to get and cache the response if the node response is directly used
-			const writeHead = nodeResponse.writeHead;
-			let encoder;
-			nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
-				nodeResponse.setHeader('X-HarperDB-Cache', 'MISS');
-				let headersObject = headers ?? messageOrHeaders;
-				getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
-				// needed
-				if (Array.isArray(messageOrHeaders?.[0])) {
-					messageOrHeaders = messageOrHeaders.reduce((acc, [key, value]) => {
-						acc[key] = value;
-						return acc;
-					}, {});
+
+const setCacheSource = (additionalDbNames) => {
+	const cacheDbNames = [DEFAULT_CACHE_DB_NAME, ...additionalDbNames];
+
+	cacheDbNames.forEach((dbName) => {
+		const cacheDB = databases[dbName];
+
+		logger.info(`Establishing cache source for database: ${dbName}`);
+
+		cacheDB.HttpCache.sourcedFrom({
+			async get(path, context) {
+				const request = context.requestContext;
+				if (request.maxAgeSeconds) context.expiresAt = request.maxAgeSeconds * 1000 + Date.now();
+				let expiresSWRAt;
+				if (request.staleWhileRevalidateSeconds) {
+					// this is the time at which the response can be served stale while revalidating, after the main expiresAt time
+					expiresSWRAt = request.staleWhileRevalidateSeconds * 1000 + (context.expiresAt ?? Date.now());
 				}
-				writeHead.call(nodeResponse, status, messageOrHeaders, headers);
-			};
-			let acceptEncoding = request.headers.get('Accept-Encoding');
-			let acceptsBrotli = false;
-			if (acceptEncoding) {
-				// we can only cache brotli responses, so we need to ensure that we are only accepting brotli (or nothing)
-				if (acceptEncoding.includes('br')) {
-					request.headers.set('Accept-Encoding', 'br');
-					acceptsBrotli = true;
-				} else request.headers.delete('Accept-Encoding');
-			}
-			function getEncoder() {
-				if (encoder) return encoder;
-				let encoding = nodeResponse.getHeader('Content-Encoding');
-				let contentType = nodeResponse.getHeader('Content-Type') ?? '';
-				const alreadyEncoded = encoding === 'br';
-				if (acceptsBrotli && !alreadyEncoded) {
-					// if the client accepts brotli, and it wasn't returned to us in Brotli, we can provide the compression here
-					nodeResponse.setHeader('Content-Encoding', 'br');
-					nodeResponse.removeHeader('Content-Length');
-					encoder = createBrotliCompress({
-						params: {
-							[constants.BROTLI_PARAM_MODE]:
-								contentType.includes('json') || contentType.includes('text')
-									? constants.BROTLI_MODE_TEXT
-									: constants.BROTLI_MODE_GENERIC,
-							[constants.BROTLI_PARAM_QUALITY]: 2, // go fast
-						},
-					});
-					encoder.on('data', writeOut);
-					encoder.on('end', endOut);
-				} else {
-					encoder = {
-						// default direct encoder
-						write: writeOut,
-						end: endOut,
+				return new Promise((resolve, reject) => {
+					const nodeResponse = request._nodeResponse;
+					if (!nodeResponse) return;
+					// intercept the main methods to get and cache the response if the node response is directly used
+					const writeHead = nodeResponse.writeHead;
+					let encoder;
+					nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
+						nodeResponse.setHeader('X-HarperDB-Cache', 'MISS');
+						let headersObject = headers ?? messageOrHeaders;
+						getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
+						// needed
+						if (Array.isArray(messageOrHeaders?.[0])) {
+							messageOrHeaders = messageOrHeaders.reduce((acc, [key, value]) => {
+								acc[key] = value;
+								return acc;
+							}, {});
+						}
+						writeHead.call(nodeResponse, status, messageOrHeaders, headers);
 					};
-				}
-				return encoder;
-			}
-			const blocks = []; // collect the blocks of response data to cache
-			const writeResponse = nodeResponse.write;
-			const endResponse = nodeResponse.end;
-			function writeOut(block) {
-				if (typeof block === 'string') block = Buffer.from(block);
-				blocks.push(block);
-				writeResponse.call(nodeResponse, block);
-			}
-			async function endOut(block) {
-				if (block) {
-					if (typeof block === 'string') block = Buffer.from(block);
-					blocks.push(block);
-				}
-				endResponse.call(nodeResponse, block);
-				const headers = Object.assign({}, nodeResponse.getHeaders());
-				delete headers['x-harperdb-cache'];
-				delete headers.connection;
-				let etag = headers.etag;
-				if (!etag) headers.etag = Date.now().toString(32);
-				// cache the response, with the headers and content
-				const content = blocks.length > 1 ? Buffer.concat(blocks) : blocks[0];
-				resolve({
-					id: path,
-					expiresSWRAt,
-					headers,
-					content: typeof createBlob === 'function' ? await newBlob(content) : content,
-				});
-				let pathStart = request.pathname.match(/^.\w*/)?.[0] ?? request.pathname;
-				server.recordAnalytics(performance.now() - request.startTime, 'http-cache-miss', pathStart);
-			}
-			nodeResponse.write = (block) => {
-				getEncoder().write(block);
-			};
-			nodeResponse.end = (block) => {
-				// if the downstream handler is directly writing to the node response object, we need to capture and cache the
-				// response
-				if (nodeResponse.statusCode !== 200) {
-					context.noCacheStore = true;
-				}
-				if (block instanceof ReadableStream) {
-					const piped = Readable.fromWeb(block).pipe(encoder);
-					piped.on('finish', () => {
+					let acceptEncoding = request.headers.get('Accept-Encoding');
+					let acceptsBrotli = false;
+					if (acceptEncoding) {
+						// we can only cache brotli responses, so we need to ensure that we are only accepting brotli (or nothing)
+						if (acceptEncoding.includes('br')) {
+							request.headers.set('Accept-Encoding', 'br');
+							acceptsBrotli = true;
+						} else request.headers.delete('Accept-Encoding');
+					}
+					function getEncoder() {
+						if (encoder) return encoder;
+						let encoding = nodeResponse.getHeader('Content-Encoding');
+						let contentType = nodeResponse.getHeader('Content-Type') ?? '';
+						const alreadyEncoded = encoding === 'br';
+						if (acceptsBrotli && !alreadyEncoded) {
+							// if the client accepts brotli, and it wasn't returned to us in Brotli, we can provide the compression here
+							nodeResponse.setHeader('Content-Encoding', 'br');
+							nodeResponse.removeHeader('Content-Length');
+							encoder = createBrotliCompress({
+								params: {
+									[constants.BROTLI_PARAM_MODE]:
+										contentType.includes('json') || contentType.includes('text')
+											? constants.BROTLI_MODE_TEXT
+											: constants.BROTLI_MODE_GENERIC,
+									[constants.BROTLI_PARAM_QUALITY]: 2, // go fast
+								},
+							});
+							encoder.on('data', writeOut);
+							encoder.on('end', endOut);
+						} else {
+							encoder = {
+								// default direct encoder
+								write: writeOut,
+								end: endOut,
+							};
+						}
+						return encoder;
+					}
+					const blocks = []; // collect the blocks of response data to cache
+					const writeResponse = nodeResponse.write;
+					const endResponse = nodeResponse.end;
+					function writeOut(block) {
+						if (typeof block === 'string') block = Buffer.from(block);
+						blocks.push(block);
+						writeResponse.call(nodeResponse, block);
+					}
+					async function endOut(block) {
+						if (block) {
+							if (typeof block === 'string') block = Buffer.from(block);
+							blocks.push(block);
+						}
+						endResponse.call(nodeResponse, block);
+						const headers = Object.assign({}, nodeResponse.getHeaders());
+						delete headers['x-harperdb-cache'];
+						delete headers.connection;
+						let etag = headers.etag;
+						if (!etag) headers.etag = Date.now().toString(32);
+						// cache the response, with the headers and content
+						const content = blocks.length > 1 ? Buffer.concat(blocks) : blocks[0];
 						resolve({
 							id: path,
-							headers: nodeResponse.getHeaders(),
-							//content: blocks.length > 1 ? Buffer.concat(blocks) : blocks[0],
+							expiresSWRAt,
+							headers,
+							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content,
 						});
-					});
-					return;
-				}
-				getEncoder().end(block);
-			};
-			if (!request.cacheNextHandler) {
-				return resolve();
-			}
-			let response = request.cacheNextHandler(request);
-			if (response?.then) {
-				response.then(forResponse);
-			} else forResponse(response);
-			async function forResponse(response) {
-				if (!response) return;
-				if (response.status !== 200) context.noCacheStore = true;
-				let headersObject = {};
-				for (let [key, value] of response.headers) {
-					headersObject[key] = value;
-				}
-				let cacheControl = response.headers.get('cache-control');
-				exports.parseHeaderValue(cacheControl).forEach((part) => {
-					if (part.name === 'no-store') context.noCacheStore = true;
-					if (part.name === 'no-cache') context.noCache = true;
-					if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
+						let pathStart = request.pathname.match(/^.\w*/)?.[0] ?? request.pathname;
+						server.recordAnalytics(performance.now() - request.startTime, 'http-cache-miss', pathStart);
+					}
+					nodeResponse.write = (block) => {
+						getEncoder().write(block);
+					};
+					nodeResponse.end = (block) => {
+						// if the downstream handler is directly writing to the node response object, we need to capture and cache the
+						// response
+						if (nodeResponse.statusCode !== 200) {
+							context.noCacheStore = true;
+						}
+						if (block instanceof ReadableStream) {
+							const piped = Readable.fromWeb(block).pipe(encoder);
+							piped.on('finish', () => {
+								resolve({
+									id: path,
+									headers: nodeResponse.getHeaders(),
+									//content: blocks.length > 1 ? Buffer.concat(blocks) : blocks[0],
+								});
+							});
+							return;
+						}
+						getEncoder().end(block);
+					};
+					if (!request.cacheNextHandler) {
+						return resolve();
+					}
+					let response = request.cacheNextHandler(request);
+					if (response?.then) {
+						response.then(forResponse);
+					} else forResponse(response);
+					async function forResponse(response) {
+						if (!response) return;
+						if (response.status !== 200) context.noCacheStore = true;
+						let headersObject = {};
+						for (let [key, value] of response.headers) {
+							headersObject[key] = value;
+						}
+						let cacheControl = response.headers.get('cache-control');
+						exports.parseHeaderValue(cacheControl).forEach((part) => {
+							if (part.name === 'no-store') context.noCacheStore = true;
+							if (part.name === 'no-cache') context.noCache = true;
+							if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
+						});
+						let etag = response.headers.get('ETag') || response.headers.get('Last-Modified');
+						if (!etag) headersObject.ETag = Date.now().toString(32);
+						// TODO: handle streaming responses
+						let content = response.body;
+						resolve({
+							id: path,
+							expiresSWRAt,
+							headers: headersObject,
+							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content, // utilize blobs if they are available
+						});
+					}
 				});
-				let etag = response.headers.get('ETag') || response.headers.get('Last-Modified');
-				if (!etag) headersObject.ETag = Date.now().toString(32);
-				// TODO: handle streaming responses
-				let content = response.body;
-				resolve({
-					id: path,
-					expiresSWRAt,
-					headers: headersObject,
-					content: typeof createBlob === 'function' ? await newBlob(content) : content, // utilize blobs if they are available
-				});
-			}
+			},
+			name: `${dbName} DB http cache resolver`,
 		});
-	},
-	name: 'http cache resolver',
-});
-class HttpCacheWithSWR extends HttpCache {
-	// use directly URL paths for ids
-	static parsePath(path) {
-		return decodeURIComponent(path);
-	}
-	allowStaleWhileRevalidate(entry, id) {
-		return entry.value?.expiresSWRAt > Date.now();
-	}
-}
+
+		class HttpCacheWithSWR extends cacheDB.HttpCache {
+			// use directly URL paths for ids
+			static parsePath(path) {
+				return decodeURIComponent(path);
+			}
+			allowStaleWhileRevalidate(entry, id) {
+				return entry.value?.expiresSWRAt > Date.now();
+			}
+		}
+
+		server.resources.set(`${dbName}WithSWR`, HttpCacheWithSWR);
+	});
+};
+
 /**
  * This parser is used to parse header values.
  *
