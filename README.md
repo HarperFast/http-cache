@@ -29,3 +29,23 @@ npm install @harperdb/http-cache
 ### `port: number`
 
 Specify a port for the caching server. Defaults to `9926`.
+
+## Cache handler options
+
+- clearRestIntervalCount - Number of records to invalidate prior to pausing when /invalidate endpoint is called
+- clearRestIntervalMs - Duration of pause in milliseconds when /invalidate endpoint is called
+- scheduledFullCacheClearTime - Time of day to perform a full cache clear (Expressed as hours in 24-hour format UTC time, i.e. 10.33 = 10:20 AM UTC)
+- additionalCacheDatabaseGroups - Array of additional database groups to use for caching. Each group will create a new database to store cached records.
+
+## Invalidation
+
+Cache can be invalidated via a POST request to /invalidate
+
+This will invalidate records from the default `cache` database. To invalidate records from an additional cache database, use the `x-cache-group` request header to specify the database group name.
+
+i.e.
+
+```
+POST /invalidate
+HEADER: 'x-cache-group: api'
+```
