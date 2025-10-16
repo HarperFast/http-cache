@@ -68,7 +68,7 @@ exports.getCacheHandler = function (options) {
 
 	return async (request, nextHandler) => {
 		// matches path /invalidate or /invalidate/*
-		if (/^\/invalidate(\/.*)?$/.test(request.pathname)) {
+		if (request.pathname === '/invalidate') {
 			if (!request.user?.role.permission.super_user) {
 				let error = new Error('Unauthorized');
 				error.statusCode = 401;
