@@ -75,7 +75,7 @@ exports.getCacheHandler = function (options) {
 				throw error;
 			}
 
-			const cacheGroup = request.pathname.split('/invalidate/')?.[1] ?? DEFAULT_CACHE_DB_NAME;
+			const cacheGroup = request.headers?.get('x-cache-group') ?? DEFAULT_CACHE_DB_NAME;
 			const cacheTable = databases[cacheGroup].HttpCache;
 
 			// invalidate the cache
