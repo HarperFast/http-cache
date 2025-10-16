@@ -14,13 +14,15 @@ const DEFAULT_CLEAR_REST_INTERVAL_MS = 10;
 
 const DEFAULT_CACHE_DB_NAME = 'cache';
 
+const cachesWithSWR = new Map();
+
 const newBlob = async (content, cacheTable) => {
 	const blob = await createBlob(content);
 	await blob.save(cacheTable);
 	return blob;
 };
 
-const ensureDatabases = async (groups) => {
+const ensureDatabases = async (groups = []) => {
 	logger.info(`Using additional cache database groups: ${groups.join(', ')}`);
 	for (const cacheGroupDb of groups) {
 		if (!databases[cacheGroupDb]) {
@@ -58,12 +60,11 @@ const ensureDatabases = async (groups) => {
  * This is the handler that is used to cache the response. It is defined and exported so other middleware can directly
  * use it and set a cacheKey or bypass the cache
  */
-exports.getCacheHandler = async function (options) {
-	if (server.workerIndex === 0 && options?.additionalCacheDatabaseGroups?.length) {
-		await ensureDatabases(options.additionalCacheDatabaseGroups);
-	}
-
-	setCacheSource(options?.additionalCacheDatabaseGroups ?? []);
+exports.getCacheHandler = function (options) {
+	setCacheSource([DEFAULT_CACHE_DB_NAME]);
+	ensureDatabases(options?.additionalCacheDatabaseGroups).then(() => {
+		setCacheSource(options?.additionalCacheDatabaseGroups ?? []);
+	});
 
 	return async (request, nextHandler) => {
 		// matches path /invalidate or /invalidate/*
@@ -74,7 +75,7 @@ exports.getCacheHandler = async function (options) {
 				throw error;
 			}
 
-			const cacheGroup = str.split('/invalidate/')?.[1] ?? DEFAULT_CACHE_DB_NAME;
+			const cacheGroup = request.pathname.split('/invalidate/')?.[1] ?? DEFAULT_CACHE_DB_NAME;
 			const cacheTable = databases[cacheGroup].HttpCache;
 
 			// invalidate the cache
@@ -160,7 +161,7 @@ exports.getCacheHandler = async function (options) {
 				cacheKey = cacheKey.slice(0, KEY_OVERFLOW) + ':' + crypto.createHash('md5').update(cacheKey).digest('hex');
 			}
 			// use our cache table, using the cacheKey if provided, otherwise use the URL/path
-			const cacheWithSWR = server.resources.get(`${request.cacheGroup ?? DEFAULT_CACHE_DB_NAME}WithSWR`).Resource;
+			const cacheWithSWR = cachesWithSWR.get(request.cacheGroup ?? DEFAULT_CACHE_DB_NAME);
 			let response = await cacheWithSWR.get(cacheKey, request);
 			// if it is a cache miss, we let the handler actually directly write to the node response object
 			// and stream the results to the client, so we don't need to return anything here
@@ -230,9 +231,7 @@ exports.getCacheHandler = async function (options) {
  * and intercepting the response to cache it.
  */
 
-const setCacheSource = (additionalDbNames) => {
-	const cacheDbNames = [DEFAULT_CACHE_DB_NAME, ...additionalDbNames];
-
+const setCacheSource = (cacheDbNames) => {
 	cacheDbNames.forEach((dbName) => {
 		const cacheDB = databases[dbName];
 
@@ -402,7 +401,7 @@ const setCacheSource = (additionalDbNames) => {
 			}
 		}
 
-		server.resources.set(`${dbName}WithSWR`, HttpCacheWithSWR);
+		cachesWithSWR.set(dbName, HttpCacheWithSWR);
 	});
 };
 
