@@ -25,11 +25,7 @@ const newBlob = async (content, cacheTable) => {
 const ensureDatabases = async (groups = []) => {
 	logger.info(`Using additional cache database groups: ${groups.join(', ')}`);
 	for (const cacheGroupDb of groups) {
-		if (!databases[cacheGroupDb]) {
-			logger.warn(`Cache db ${cacheGroupDb} doesn't exsist. Creating...`);
-			await server.operation({ operation: 'create_database', database: cacheGroupDb });
-		}
-		if (!databases[cacheGroupDb].HttpCache) {
+		if (!databases[cacheGroupDb]?.HttpCache) {
 			logger.warn(`Cache table in ${cacheGroupDb} db doesn't exsist. Creating...`);
 			await server.operation({
 				operation: 'create_table',
@@ -74,7 +70,17 @@ exports.getCacheHandler = function (options) {
 				throw error;
 			}
 
+			const validTables = [DEFAULT_CACHE_DB_NAME, ...(options?.additionalCacheDatabaseGroups ?? [])];
 			const cacheGroup = request.headers?.get('x-cache-group') ?? DEFAULT_CACHE_DB_NAME;
+
+			if (!validTables.includes(cacheGroup)) {
+				let error = new Error(
+					`Invalid cache group sepcified: ${cacheGroup}. Must be one of: ${validTables.join(', ')}`
+				);
+				error.statusCode = 400;
+				throw error;
+			}
+
 			const cacheTable = databases[cacheGroup].HttpCache;
 
 			// invalidate the cache
