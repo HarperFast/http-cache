@@ -35,6 +35,9 @@ const ensureDatabases = async (groups = []) => {
 				expiration: 86400,
 				attributes: [
 					{
+						name: 'id',
+					},
+					{
 						name: 'expiresSWRAt',
 						type: 'Float',
 					},
