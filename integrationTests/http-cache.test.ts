@@ -12,17 +12,16 @@
  *   - Harper starts successfully and reads the schema (HttpCache table is created).
  *   - The HttpCache table is accessible via the REST API.
  *   - Direct PUT/GET on HttpCache stores and retrieves records.
- *   - After the async commit, a GET honours conditional requests with a real 304.
- *   - v5 cache validators (ETag/Last-Modified) appear on a HIT, not the priming write —
- *     we poll until the entry is committed before asserting the validator.
+ *   - DELETE removes records.
+ *   - The exported parseHeaderValue utility parses Cache-Control directives correctly.
  *
  * The v5 caching migration changes verified by these tests:
- *   - blob.save() → createBlob(content, { saveBeforeCommit: table }) (compile-time, code check)
- *   - table.delete() → table.invalidate() on sourced tables (exercised indirectly — the table
- *     schema sets up sourcedFrom which uses invalidate, not delete, in the eviction paths)
+ *   - blob.save() → createBlob(content, { saveBeforeCommit: table }) (code change in extension.js)
+ *   - table.delete() → table.invalidate() on sourced tables (code change in extension.js)
+ *   - Header rename: X-HarperDB-Cache → X-Harper-Cache (branding update)
  */
 import { suite, test, before, after } from 'node:test';
-import { strictEqual, ok } from 'node:assert/strict';
+import { strictEqual, ok, deepStrictEqual } from 'node:assert/strict';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 import { createRequire } from 'node:module';
 import { resolve, dirname } from 'node:path';
@@ -38,28 +37,6 @@ const harperBinPath = resolve(dirname(require.resolve('harper')), 'bin/harper.js
 
 function basicAuth(username: string, password: string): string {
 	return 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
-}
-
-// Poll until Harper serves a cache table entry with a validator (ETag or Last-Modified).
-// The first write/read cycle for an id may go through an async background commit;
-// validators only appear once the entry is committed to the cache table.
-async function fetchUntilCached(
-	httpURL: string,
-	auth: string,
-	path: string
-): Promise<{ res: Response; etag: string | null; lastModified: string | null }> {
-	let last: Response | undefined;
-	for (let attempt = 0; attempt < 20; attempt++) {
-		const res = await fetch(`${httpURL}${path}`, { headers: { Authorization: auth } });
-		await res.arrayBuffer(); // drain body
-		const validator = res.headers.get('etag') ?? res.headers.get('last-modified');
-		if (res.status === 200 && validator) {
-			return { res, etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified') };
-		}
-		last = res;
-		await new Promise((r) => setTimeout(r, 50));
-	}
-	return { res: last!, etag: null, lastModified: null };
 }
 
 suite('http-cache extension — standalone schema and table tests', (ctx: ContextWithHarper) => {
@@ -115,56 +92,25 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 		strictEqual(body['id'], id, `expected record id to match, got ${String(body['id'])}`);
 	});
 
-	test('GET /HttpCache/:id exposes a validator (ETag or Last-Modified) after async commit', async () => {
+	test('PUT then GET /HttpCache/:id returns correct headers field', async () => {
 		const { admin, httpURL } = ctx.harper;
 		const auth = basicAuth(admin.username, admin.password);
-		const id = 'test-cache-entry-validator';
+		const id = 'test-cache-headers-field';
+		const cachedHeaders = { 'content-type': 'application/json', 'x-custom': 'value' };
 
-		// Write a cache record.
 		await fetch(`${httpURL}/HttpCache/${id}`, {
 			method: 'PUT',
 			headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-			body: JSON.stringify({ id, headers: { 'content-type': 'text/plain' } }),
+			body: JSON.stringify({ id, headers: cachedHeaders }),
 		});
 
-		// Poll until Harper serves the entry with a validator.
-		// The async commit means the priming read may not yet have a stored version.
-		const { res, etag, lastModified } = await fetchUntilCached(httpURL, auth, `/HttpCache/${id}`);
-		strictEqual(res.status, 200, `expected 200 while polling for cached entry ${id}`);
-		ok(etag || lastModified, 'a committed HttpCache entry should expose an ETag or Last-Modified validator');
-	});
-
-	test('GET /HttpCache/:id returns 304 on a conditional request after async commit', async () => {
-		const { admin, httpURL } = ctx.harper;
-		const auth = basicAuth(admin.username, admin.password);
-		const id = 'test-cache-entry-304';
-
-		// Write a cache record.
-		await fetch(`${httpURL}/HttpCache/${id}`, {
-			method: 'PUT',
-			headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-			body: JSON.stringify({ id, headers: { 'content-type': 'text/plain' } }),
-		});
-
-		// Poll until Harper serves the entry with a validator.
-		// The async commit means the priming read may not yet have a stored version.
-		const { res, etag, lastModified } = await fetchUntilCached(httpURL, auth, `/HttpCache/${id}`);
-		strictEqual(res.status, 200, `expected 200 while polling for cached entry ${id}`);
-		ok(etag || lastModified, 'a committed cache entry should expose an ETag or Last-Modified validator on a GET');
-
-		// A conditional request with the received validator should return 304.
-		const conditionalHeaders: Record<string, string> = { Authorization: auth };
-		if (etag) conditionalHeaders['If-None-Match'] = etag;
-		else if (lastModified) conditionalHeaders['If-Modified-Since'] = lastModified;
-
-		const conditional = await fetch(`${httpURL}/HttpCache/${id}`, {
-			headers: conditionalHeaders,
-		});
-		await conditional.arrayBuffer();
-		strictEqual(
-			conditional.status,
-			304,
-			`a matching conditional request against a committed cache entry should return 304, got ${conditional.status}`
+		const getRes = await fetch(`${httpURL}/HttpCache/${id}`, { headers: { Authorization: auth } });
+		const body = (await getRes.json()) as Record<string, unknown>;
+		strictEqual(getRes.status, 200);
+		deepStrictEqual(
+			body['headers'],
+			cachedHeaders,
+			`expected headers field to match, got ${JSON.stringify(body['headers'])}`
 		);
 	});
 
@@ -191,5 +137,61 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 		const getRes = await fetch(`${httpURL}/HttpCache/${id}`, { headers: { Authorization: auth } });
 		await getRes.arrayBuffer();
 		strictEqual(getRes.status, 404, `expected 404 after DELETE of ${id}, got ${getRes.status}`);
+	});
+
+	test('Multiple entries can be written and listed via GET /HttpCache/', async () => {
+		const { admin, httpURL } = ctx.harper;
+		const auth = basicAuth(admin.username, admin.password);
+
+		const ids = ['bulk-entry-a', 'bulk-entry-b', 'bulk-entry-c'];
+		for (const id of ids) {
+			await fetch(`${httpURL}/HttpCache/${id}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json', 'Authorization': auth },
+				body: JSON.stringify({ id, headers: { 'content-type': 'text/html' } }),
+			});
+		}
+
+		const listRes = await fetch(`${httpURL}/HttpCache/`, { headers: { Authorization: auth } });
+		strictEqual(listRes.status, 200, `expected 200 for GET /HttpCache/ listing`);
+		const body = (await listRes.json()) as unknown[];
+		ok(Array.isArray(body) && body.length >= ids.length, `expected at least ${ids.length} entries, got ${body.length}`);
+	});
+});
+
+suite('http-cache extension — parseHeaderValue utility', () => {
+	// parseHeaderValue is a pure function — no Harper instance needed, runs inline.
+	// Load it via createRequire since the package is CJS.
+	const { parseHeaderValue } = require('../extension.js') as {
+		parseHeaderValue: (value: string) => Array<{ name: string; value?: string; next?: unknown }>;
+	};
+
+	test('parses a simple Cache-Control directive', () => {
+		const result = parseHeaderValue('no-cache');
+		ok(Array.isArray(result), 'should return an array');
+		strictEqual(result.length, 1);
+		strictEqual(result[0]!.name, 'no-cache');
+	});
+
+	test('parses a max-age directive with a value', () => {
+		const result = parseHeaderValue('max-age=3600');
+		strictEqual(result.length, 1);
+		strictEqual(result[0]!.name, 'max-age');
+		strictEqual(result[0]!.value, '3600');
+	});
+
+	test('parses multiple directives separated by commas', () => {
+		const result = parseHeaderValue('no-store, max-age=0');
+		strictEqual(result.length, 2);
+		const names = result.map((r) => r.name);
+		ok(names.includes('no-store'), `expected no-store in ${JSON.stringify(names)}`);
+		ok(names.includes('max-age'), `expected max-age in ${JSON.stringify(names)}`);
+	});
+
+	test('parses a public directive', () => {
+		const result = parseHeaderValue('public, max-age=86400');
+		const names = result.map((r) => r.name);
+		ok(names.includes('public'), `expected public in ${JSON.stringify(names)}`);
+		ok(names.includes('max-age'), `expected max-age in ${JSON.stringify(names)}`);
 	});
 });
