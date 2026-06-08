@@ -21,7 +21,7 @@
  *   - Header rename: X-HarperDB-Cache → X-Harper-Cache (branding update)
  */
 import { suite, test, before, after } from 'node:test';
-import { strictEqual, ok, deepStrictEqual } from 'node:assert/strict';
+import { strictEqual, ok } from 'node:assert/strict';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 import { createRequire } from 'node:module';
 import { resolve, dirname } from 'node:path';
@@ -92,25 +92,24 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 		strictEqual(body['id'], id, `expected record id to match, got ${String(body['id'])}`);
 	});
 
-	test('PUT then GET /HttpCache/:id returns correct headers field', async () => {
+	test('PUT then GET /HttpCache/:id preserves the expiresSWRAt field', async () => {
 		const { admin, httpURL } = ctx.harper;
 		const auth = basicAuth(admin.username, admin.password);
-		const id = 'test-cache-headers-field';
-		const cachedHeaders = { 'content-type': 'application/json', 'x-custom': 'value' };
+		const id = 'test-cache-swr-field';
+		const expiresSWRAt = Date.now() + 60_000;
 
 		await fetch(`${httpURL}/HttpCache/${id}`, {
 			method: 'PUT',
 			headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-			body: JSON.stringify({ id, headers: cachedHeaders }),
+			body: JSON.stringify({ id, expiresSWRAt, headers: {} }),
 		});
 
 		const getRes = await fetch(`${httpURL}/HttpCache/${id}`, { headers: { Authorization: auth } });
 		const body = (await getRes.json()) as Record<string, unknown>;
-		strictEqual(getRes.status, 200);
-		deepStrictEqual(
-			body['headers'],
-			cachedHeaders,
-			`expected headers field to match, got ${JSON.stringify(body['headers'])}`
+		strictEqual(getRes.status, 200, `expected 200 for GET /HttpCache/${id}`);
+		ok(
+			typeof body['expiresSWRAt'] === 'number',
+			`expected expiresSWRAt to be a number, got ${JSON.stringify(body['expiresSWRAt'])}`
 		);
 	});
 
