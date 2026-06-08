@@ -16,10 +16,8 @@ const DEFAULT_CACHE_DB_NAME = 'cache';
 
 const cachesWithSWR = new Map();
 
-const newBlob = async (content, cacheTable) => {
-	const blob = await createBlob(content);
-	await blob.save(cacheTable);
-	return blob;
+const newBlob = (content, cacheTable) => {
+	return createBlob(content, { saveBeforeCommit: cacheTable });
 };
 
 const ensureDatabases = async (groups = []) => {
@@ -100,7 +98,7 @@ exports.getCacheHandler = function (options) {
 				(async () => {
 					for await (let entry of searchResults) {
 						lastKey = entry.id;
-						last = cacheTable.delete(entry.id); // no context/transaction, should be non-transactional/incremental
+						last = cacheTable.invalidate(entry.id); // no context/transaction, should be non-transactional/incremental
 						if (count++ % clearRestIntervalCount === 0) {
 							await last;
 							if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
@@ -181,8 +179,8 @@ exports.getCacheHandler = function (options) {
 				let status = response.status ?? 200;
 				let body;
 				let age = Math.round((Date.now() - response.getUpdatedTime()) / 1000);
-				headers = { ...headers, 'X-HarperDB-Cache': 'HIT', 'Age': age };
-				delete headers['x-harperdb-cache'];
+				headers = { ...headers, 'X-Harper-Cache': 'HIT', 'Age': age };
+				delete headers['x-harper-cache'];
 				delete headers['content-length'];
 				if (ifNoneMatch && ifNoneMatch === etag) {
 					status = 304;
@@ -194,7 +192,7 @@ exports.getCacheHandler = function (options) {
 							body = await body.bytes();
 						} catch (_e) {
 							try {
-								await cacheTable.delete(cacheKey); // if we can't read the blob, delete it from the cache
+								await cacheTable.invalidate(cacheKey); // if we can't read the blob, invalidate it from the cache
 							} finally {
 								return nextHandler(request);
 							}
@@ -261,7 +259,7 @@ const setCacheSource = (cacheDbNames) => {
 					const writeHead = nodeResponse.writeHead;
 					let encoder;
 					nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
-						nodeResponse.setHeader('X-HarperDB-Cache', 'MISS');
+						nodeResponse.setHeader('X-Harper-Cache', 'MISS');
 						let headersObject = headers ?? messageOrHeaders;
 						getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
 						// needed
@@ -326,7 +324,7 @@ const setCacheSource = (cacheDbNames) => {
 						}
 						endResponse.call(nodeResponse, block);
 						const headers = Object.assign({}, nodeResponse.getHeaders());
-						delete headers['x-harperdb-cache'];
+						delete headers['x-harper-cache'];
 						delete headers.connection;
 						let etag = headers.etag;
 						if (!etag) headers.etag = Date.now().toString(32);
