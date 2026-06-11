@@ -200,7 +200,7 @@ exports.getCacheHandler = function (options) {
 					}
 					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding').includes('br')) {
 						// if the client doesn't support brotli, we need to decompress the response
-						body = await new Promise((resolve) =>
+						body = await new Promise((resolve, reject) =>
 							brotliDecompress(body, (err, result) => {
 								if (err) reject(err);
 								else resolve(result);
@@ -349,7 +349,8 @@ const setCacheSource = (cacheDbNames) => {
 							context.noCacheStore = true;
 						}
 						if (block instanceof ReadableStream) {
-							const piped = Readable.fromWeb(block).pipe(encoder);
+							const enc = getEncoder();
+							const piped = Readable.fromWeb(block).pipe(enc);
 							piped.on('finish', () => {
 								resolve({
 									id: path,
@@ -376,11 +377,13 @@ const setCacheSource = (cacheDbNames) => {
 							headersObject[key] = value;
 						}
 						let cacheControl = response.headers.get('cache-control');
-						exports.parseHeaderValue(cacheControl).forEach((part) => {
-							if (part.name === 'no-store') context.noCacheStore = true;
-							if (part.name === 'no-cache') context.noCache = true;
-							if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
-						});
+						if (cacheControl) {
+							exports.parseHeaderValue(cacheControl).forEach((part) => {
+								if (part.name === 'no-store') context.noCacheStore = true;
+								if (part.name === 'no-cache') context.noCache = true;
+								if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
+							});
+						}
 						let etag = response.headers.get('ETag') || response.headers.get('Last-Modified');
 						if (!etag) headersObject.ETag = Date.now().toString(32);
 						// TODO: handle streaming responses
