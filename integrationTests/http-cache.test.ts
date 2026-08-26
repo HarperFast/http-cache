@@ -98,11 +98,15 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 		const id = 'test-cache-swr-field';
 		const expiresSWRAt = Date.now() + 60_000;
 
-		await fetch(`${httpURL}/HttpCache/${id}`, {
-			method: 'PUT',
-			headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-			body: JSON.stringify({ id, expiresSWRAt, headers: {} }),
-		});
+		// Bodies are drained even where unused: an undrained undici response keeps its
+		// socket open and can hang or exhaust sockets later in the suite.
+		await (
+			await fetch(`${httpURL}/HttpCache/${id}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json', 'Authorization': auth },
+				body: JSON.stringify({ id, expiresSWRAt, headers: {} }),
+			})
+		).arrayBuffer();
 
 		const getRes = await fetch(`${httpURL}/HttpCache/${id}`, { headers: { Authorization: auth } });
 		const body = (await getRes.json()) as Record<string, unknown>;
@@ -119,11 +123,13 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 		const id = 'test-cache-entry-delete';
 
 		// Write then delete.
-		await fetch(`${httpURL}/HttpCache/${id}`, {
-			method: 'PUT',
-			headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-			body: JSON.stringify({ id, headers: {} }),
-		});
+		await (
+			await fetch(`${httpURL}/HttpCache/${id}`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json', 'Authorization': auth },
+				body: JSON.stringify({ id, headers: {} }),
+			})
+		).arrayBuffer();
 
 		const delRes = await fetch(`${httpURL}/HttpCache/${id}`, {
 			method: 'DELETE',
@@ -144,11 +150,13 @@ suite('http-cache extension — standalone schema and table tests', (ctx: Contex
 
 		const ids = ['bulk-entry-a', 'bulk-entry-b', 'bulk-entry-c'];
 		for (const id of ids) {
-			await fetch(`${httpURL}/HttpCache/${id}`, {
-				method: 'PUT',
-				headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-				body: JSON.stringify({ id, headers: { 'content-type': 'text/html' } }),
-			});
+			await (
+				await fetch(`${httpURL}/HttpCache/${id}`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json', 'Authorization': auth },
+					body: JSON.stringify({ id, headers: { 'content-type': 'text/html' } }),
+				})
+			).arrayBuffer();
 		}
 
 		const listRes = await fetch(`${httpURL}/HttpCache/`, { headers: { Authorization: auth } });

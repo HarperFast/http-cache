@@ -94,17 +94,28 @@ exports.getCacheHandler = function (options) {
 				const clearRestIntervalMs = options.clearRestIntervalMs ?? DEFAULT_CLEAR_REST_INTERVAL_MS;
 				// do this before entering the async function in case it throws
 				const searchResults = cacheTable.search(query, { onlyIfCached: true, noCacheStore: true });
-				let finished, lastKey;
+				let finished, lastKey, failure;
 				(async () => {
-					for await (let entry of searchResults) {
-						lastKey = entry.id;
-						last = cacheTable.invalidate(entry.id); // no context/transaction, should be non-transactional/incremental
-						if (count++ % clearRestIntervalCount === 0) {
-							await last;
-							if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
+					try {
+						for await (let entry of searchResults) {
+							lastKey = entry.id;
+							last = cacheTable.invalidate(entry.id); // no context/transaction, should be non-transactional/incremental
+							if (count++ % clearRestIntervalCount === 0) {
+								await last;
+								if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
+							}
 						}
+						// await the final in-flight invalidation so completion isn't reported early
+						await last;
+					} catch (error) {
+						// This IIFE is deliberately not awaited, so without this catch a throw here
+						// would be an unhandled rejection AND would leave `finished` undefined —
+						// the progress generator below would then loop forever, hanging the response.
+						failure = error;
+						logger.error(`Cache invalidation failed after ${count} entries`, error);
+					} finally {
+						finished = true;
 					}
-					finished = true;
 				})();
 				return {
 					status: 200,
@@ -114,6 +125,10 @@ exports.getCacheHandler = function (options) {
 						while (!finished) {
 							yield `Invalidated ${count} entries, last deleted ${lastKey}\n`;
 							await new Promise((resolve) => setTimeout(resolve, 1000));
+						}
+						if (failure) {
+							yield `Cache invalidation failed after ${count} entries: ${failure.message ?? failure}\n`;
+							return;
 						}
 						yield `Cache invalidation complete, deleted ${count} entries\n`;
 					})(),
@@ -190,12 +205,17 @@ exports.getCacheHandler = function (options) {
 						try {
 							// attempt to convert it from a blob to a buffer
 							body = await body.bytes();
-						} catch (_e) {
+						} catch (blobError) {
+							// The blob is unreadable, so drop the entry and fall through to the origin.
+							// Both failures are logged: `return` inside a `finally` would have silently
+							// swallowed an invalidate() rejection, leaving a poisoned entry with no trace.
+							logger.warn(`Unreadable cache blob for ${cacheKey}; invalidating`, blobError);
 							try {
 								await cacheTable.invalidate(cacheKey); // if we can't read the blob, invalidate it from the cache
-							} finally {
-								return nextHandler(request);
+							} catch (invalidateError) {
+								logger.error(`Failed to invalidate unreadable cache entry ${cacheKey}`, invalidateError);
 							}
+							return nextHandler(request);
 						}
 					}
 					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding').includes('br')) {
