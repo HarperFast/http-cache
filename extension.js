@@ -1,6 +1,12 @@
 const { Readable } = require('node:stream');
 const { createBrotliCompress, brotliDecompress, constants } = require('zlib');
 const crypto = require('crypto');
+const {
+	CACHE_STATUS_HEADERS,
+	createCacheBlob,
+	cachedHeadersToObject,
+	withoutCacheStatusHeaders,
+} = require('./cacheUtils.js');
 /**
  * Setup the caching middleware
  */
@@ -15,10 +21,6 @@ const DEFAULT_CLEAR_REST_INTERVAL_MS = 10;
 const DEFAULT_CACHE_DB_NAME = 'cache';
 
 const cachesWithSWR = new Map();
-
-const newBlob = (content, cacheTable) => {
-	return createBlob(content, { saveBeforeCommit: cacheTable });
-};
 
 const ensureDatabases = async (groups = []) => {
 	logger.info(`Using additional cache database groups: ${groups.join(', ')}`);
@@ -189,13 +191,13 @@ exports.getCacheHandler = function (options) {
 			if (!request._nodeResponse.writableEnded) {
 				// but if we have a cache hit, we can return the cached response
 				let ifNoneMatch = request.headers.get('If-None-Match');
-				let headers = response.headers.toJSON();
+				const headers = withoutCacheStatusHeaders(cachedHeadersToObject(response.headers));
 				const etag = headers.etag;
 				let status = response.status ?? 200;
 				let body;
 				let age = Math.round((Date.now() - response.getUpdatedTime()) / 1000);
-				headers = { ...headers, 'X-Harper-Cache': 'HIT', 'Age': age };
-				delete headers['x-harper-cache'];
+				for (const name of CACHE_STATUS_HEADERS) headers[name] = 'HIT';
+				headers['Age'] = age;
 				delete headers['content-length'];
 				if (ifNoneMatch && ifNoneMatch === etag) {
 					status = 304;
@@ -218,7 +220,7 @@ exports.getCacheHandler = function (options) {
 							return nextHandler(request);
 						}
 					}
-					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding').includes('br')) {
+					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding')?.includes('br')) {
 						// if the client doesn't support brotli, we need to decompress the response
 						body = await new Promise((resolve, reject) =>
 							brotliDecompress(body, (err, result) => {
@@ -279,7 +281,7 @@ const setCacheSource = (cacheDbNames) => {
 					const writeHead = nodeResponse.writeHead;
 					let encoder;
 					nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
-						nodeResponse.setHeader('X-Harper-Cache', 'MISS');
+						for (const name of CACHE_STATUS_HEADERS) nodeResponse.setHeader(name, 'MISS');
 						let headersObject = headers ?? messageOrHeaders;
 						getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
 						// needed
@@ -343,8 +345,7 @@ const setCacheSource = (cacheDbNames) => {
 							blocks.push(block);
 						}
 						endResponse.call(nodeResponse, block);
-						const headers = Object.assign({}, nodeResponse.getHeaders());
-						delete headers['x-harper-cache'];
+						const headers = withoutCacheStatusHeaders(nodeResponse.getHeaders());
 						delete headers.connection;
 						let etag = headers.etag;
 						if (!etag) headers.etag = Date.now().toString(32);
@@ -354,7 +355,7 @@ const setCacheSource = (cacheDbNames) => {
 							id: path,
 							expiresSWRAt,
 							headers,
-							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content,
+							content: typeof createBlob === 'function' ? await createCacheBlob(content, cacheDB.HttpCache) : content,
 						});
 						let pathStart = request.pathname.match(/^.\w*/)?.[0] ?? request.pathname;
 						server.recordAnalytics(performance.now() - request.startTime, 'http-cache-miss', pathStart);
@@ -374,7 +375,7 @@ const setCacheSource = (cacheDbNames) => {
 							piped.on('finish', () => {
 								resolve({
 									id: path,
-									headers: nodeResponse.getHeaders(),
+									headers: withoutCacheStatusHeaders(nodeResponse.getHeaders()),
 									//content: blocks.length > 1 ? Buffer.concat(blocks) : blocks[0],
 								});
 							});
@@ -396,6 +397,7 @@ const setCacheSource = (cacheDbNames) => {
 						for (let [key, value] of response.headers) {
 							headersObject[key] = value;
 						}
+						headersObject = withoutCacheStatusHeaders(headersObject);
 						let cacheControl = response.headers.get('cache-control');
 						if (cacheControl) {
 							exports.parseHeaderValue(cacheControl).forEach((part) => {
@@ -412,7 +414,7 @@ const setCacheSource = (cacheDbNames) => {
 							id: path,
 							expiresSWRAt,
 							headers: headersObject,
-							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content, // utilize blobs if they are available
+							content: typeof createBlob === 'function' ? await createCacheBlob(content, cacheDB.HttpCache) : content, // utilize blobs if they are available
 						});
 					}
 				});
