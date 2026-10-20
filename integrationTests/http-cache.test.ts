@@ -32,14 +32,16 @@ function basicAuth(username: string, password: string): string {
 	return 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
 }
 
-async function sendOperation(ctx: ContextWithHarper, operation: Record<string, unknown>): Promise<void> {
+async function sendOperation(ctx: ContextWithHarper, operation: Record<string, unknown>): Promise<unknown> {
 	const { username, password } = ctx.harper.admin;
 	const response = await fetch(ctx.harper.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json', 'Authorization': basicAuth(username, password) },
 		body: JSON.stringify(operation),
 	});
-	strictEqual(response.status, 200, await response.text());
+	const body = await response.text();
+	strictEqual(response.status, 200, body);
+	return JSON.parse(body);
 }
 
 function assertCacheStatus(response: Response, expected: string): void {
@@ -79,6 +81,39 @@ suite(`http-cache middleware on ${harperPackage}`, (ctx: ContextWithHarper) => {
 		strictEqual(await hit.text(), missBody);
 		ok(hit.headers.get('ETag'), 'a cache hit should carry an ETag');
 		ok(hit.headers.get('Age') !== null, 'a cache hit should carry an Age');
+	});
+
+	test('serves a large, file-backed body from the cache', async () => {
+		const url = `${ctx.harper.httpURL}/origin/large/body`;
+
+		const miss = await fetch(url);
+		const missBody = await miss.text();
+		assertCacheStatus(miss, 'MISS');
+		ok(missBody.length > 8192, `expected a large body, got ${missBody.length} bytes`);
+
+		const hit = await fetch(url);
+		assertCacheStatus(hit, 'HIT');
+		strictEqual(await hit.text(), missBody);
+	});
+
+	test('stores the response without either cache status header', async () => {
+		const id = '/origin/stored-headers';
+		const miss = await fetch(`${ctx.harper.httpURL}${id}`);
+		await miss.arrayBuffer();
+		assertCacheStatus(miss, 'MISS');
+
+		const [record] = (await sendOperation(ctx, {
+			operation: 'search_by_id',
+			database: 'cache',
+			table: 'HttpCache',
+			ids: [id],
+			get_attributes: ['id', 'headers'],
+		})) as Array<{ id: string; headers: Record<string, unknown> }>;
+		strictEqual(record?.id, id);
+		strictEqual(record.headers['content-type'], 'text/plain');
+		const storedNames = Object.keys(record.headers).map((name) => name.toLowerCase());
+		ok(!storedNames.includes('x-harper-cache'), `stored headers: ${storedNames.join(', ')}`);
+		ok(!storedNames.includes('x-harperdb-cache'), `stored headers: ${storedNames.join(', ')}`);
 	});
 
 	test('returns 304 for a matching If-None-Match', async () => {
