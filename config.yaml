@@ -1,4 +1,3 @@
-rest: true
 extensionModule: ./extension.js
 graphqlSchema:
   files: '*.graphql'
