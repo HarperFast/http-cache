@@ -1,0 +1,5 @@
+rest: true
+'@harperdb/http-cache':
+  package: '@harperdb/http-cache'
+jsResource:
+  files: 'origin.js'

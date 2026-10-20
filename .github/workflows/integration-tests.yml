@@ -39,8 +39,8 @@ jobs:
             echo "node-versions=[$NODE_VER]" >> $GITHUB_OUTPUT
           fi
 
-  integration-tests:
-    name: Integration Tests (Node ${{ matrix.node-version }})
+  unit-tests:
+    name: Unit Tests (Node ${{ matrix.node-version }})
     needs: [generate-node-version-matrix]
     runs-on: ubuntu-latest
 
@@ -61,9 +61,37 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run unit tests
+        run: npm run test:unit
+
+  integration-tests:
+    name: Integration Tests (Node ${{ matrix.node-version }}, ${{ matrix.harper-package }})
+    needs: [generate-node-version-matrix]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+        # npm aliases from devDependencies: harper is v5, harperdb-4.x pin the v4 release lines
+        harper-package: [harper, harperdb-4.7, harperdb-4.6]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Run integration tests
         run: npm run test:integration
         env:
+          HARPER_PACKAGE: ${{ matrix.harper-package }}
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-test-logs
           FORCE_COLOR: '1'
 
@@ -71,6 +99,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: harper-logs-node-${{ matrix.node-version }}
+          name: harper-logs-node-${{ matrix.node-version }}-${{ matrix.harper-package }}
           path: /tmp/harper-test-logs/
           retention-days: 7
