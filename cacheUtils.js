@@ -18,10 +18,21 @@ exports.cachedHeadersToObject = function (rawHeaders) {
 	return typeof rawHeaders?.toJSON === 'function' ? rawHeaders.toJSON() : { ...rawHeaders };
 };
 
-exports.withoutCacheStatusHeaders = function (headers) {
+// these describe the original connection; replaying them with a cached body's Content-Length makes an invalid response
+const HOP_BY_HOP_HEADER_KEYS = new Set(['connection', 'keep-alive', 'transfer-encoding']);
+
+function withoutHeaderKeys(headers, keys) {
 	const filtered = {};
 	for (const name in headers) {
-		if (!CACHE_STATUS_HEADER_KEYS.has(name.toLowerCase())) filtered[name] = headers[name];
+		if (!keys.has(name.toLowerCase())) filtered[name] = headers[name];
 	}
 	return filtered;
+}
+
+exports.withoutCacheStatusHeaders = function (headers) {
+	return withoutHeaderKeys(headers, CACHE_STATUS_HEADER_KEYS);
+};
+
+exports.withoutHopByHopHeaders = function (headers) {
+	return withoutHeaderKeys(headers, HOP_BY_HOP_HEADER_KEYS);
 };

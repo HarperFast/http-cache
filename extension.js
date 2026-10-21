@@ -6,6 +6,7 @@ const {
 	createCacheBlob,
 	cachedHeadersToObject,
 	withoutCacheStatusHeaders,
+	withoutHopByHopHeaders,
 } = require('./cacheUtils.js');
 /**
  * Setup the caching middleware
@@ -191,7 +192,7 @@ exports.getCacheHandler = function (options) {
 			if (!request._nodeResponse.writableEnded) {
 				// but if we have a cache hit, we can return the cached response
 				let ifNoneMatch = request.headers.get('If-None-Match');
-				const headers = withoutCacheStatusHeaders(cachedHeadersToObject(response.headers));
+				const headers = withoutHopByHopHeaders(withoutCacheStatusHeaders(cachedHeadersToObject(response.headers)));
 				const etag = headers.etag;
 				let status = response.status ?? 200;
 				let body;
@@ -350,8 +351,7 @@ const setCacheSource = (cacheDbNames) => {
 							blocks.push(block);
 						}
 						endResponse.call(nodeResponse, block);
-						const headers = withoutCacheStatusHeaders(nodeResponse.getHeaders());
-						delete headers.connection;
+						const headers = withoutHopByHopHeaders(withoutCacheStatusHeaders(nodeResponse.getHeaders()));
 						let etag = headers.etag;
 						if (!etag) headers.etag = Date.now().toString(32);
 						// cache the response, with the headers and content
@@ -380,7 +380,7 @@ const setCacheSource = (cacheDbNames) => {
 							piped.on('finish', () => {
 								resolve({
 									id: path,
-									headers: withoutCacheStatusHeaders(nodeResponse.getHeaders()),
+									headers: withoutHopByHopHeaders(withoutCacheStatusHeaders(nodeResponse.getHeaders())),
 									//content: blocks.length > 1 ? Buffer.concat(blocks) : blocks[0],
 								});
 							});
@@ -402,7 +402,7 @@ const setCacheSource = (cacheDbNames) => {
 						for (let [key, value] of response.headers) {
 							headersObject[key] = value;
 						}
-						headersObject = withoutCacheStatusHeaders(headersObject);
+						headersObject = withoutHopByHopHeaders(withoutCacheStatusHeaders(headersObject));
 						let cacheControl = response.headers.get('cache-control');
 						if (cacheControl) {
 							exports.parseHeaderValue(cacheControl).forEach((part) => {

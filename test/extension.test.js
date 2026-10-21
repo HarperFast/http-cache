@@ -201,6 +201,26 @@ suite('cache handler', () => {
 			strictEqual(request._nodeResponse.chunks.join(''), 'v4 body');
 		});
 
+		test('drops the stored hop-by-hop headers so a hit is not both chunked and length-delimited', async () => {
+			FakeHttpCache.record = cachedRecord({
+				headers: {
+					'etag': 'etag-1',
+					'Transfer-Encoding': 'chunked',
+					'connection': 'keep-alive',
+					'Keep-Alive': 'timeout=5',
+				},
+			});
+			const request = createRequest();
+			await handler(request, nextHandler);
+
+			const { headers } = request._nodeResponse.writtenHead;
+			deepStrictEqual(
+				Object.keys(headers).filter((name) => /^(transfer-encoding|connection|keep-alive)$/i.test(name)),
+				[]
+			);
+			strictEqual(headers['Content-Length'], 11);
+		});
+
 		test('returns 304 without a body when If-None-Match matches the ETag', async () => {
 			FakeHttpCache.record = cachedRecord();
 			const request = createRequest({ headers: { 'If-None-Match': 'etag-1' } });
@@ -465,6 +485,18 @@ suite('cache source', () => {
 		ok(entry.headers.etag, 'an ETag is generated for responses without one');
 		strictEqual(entry.content.toString(), 'origin body');
 		strictEqual(server.recordAnalytics.mock.calls[0].arguments[1], 'http-cache-miss');
+	});
+
+	test('stores a chunked origin response without its hop-by-hop headers', async () => {
+		const request = sourceRequest((request) => {
+			request._nodeResponse.writeHead(200, { 'transfer-encoding': 'chunked', 'keep-alive': 'timeout=5' });
+			request._nodeResponse.end('proxied');
+		});
+		const entry = await source.get('/page', { requestContext: request });
+
+		strictEqual(entry.headers['transfer-encoding'], undefined);
+		strictEqual(entry.headers['keep-alive'], undefined);
+		strictEqual(entry.content.toString(), 'proxied');
 	});
 
 	test('stores the content as a blob when createBlob is available', async () => {
