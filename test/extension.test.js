@@ -49,7 +49,8 @@ function createNodeResponse() {
 		removeHeader(name) {
 			delete headers[name.toLowerCase()];
 		},
-		writeHead(status, headersArgument) {
+		writeHead(status, messageOrHeaders, headersAfterMessage) {
+			const headersArgument = typeof messageOrHeaders === 'string' ? headersAfterMessage : messageOrHeaders;
 			this.statusCode = status;
 			this.writtenHead = { status, headers: headersArgument };
 			for (const name in headersArgument) this.setHeader(name, headersArgument[name]);
@@ -484,6 +485,30 @@ suite('cache source', () => {
 		});
 		await source.get('/page', { requestContext: request });
 		deepStrictEqual(request._nodeResponse.writtenHead.headers, { 'content-type': 'text/html' });
+	});
+
+	test('sends MISS even when the origin passes its own cache status headers to writeHead', async () => {
+		const request = sourceRequest((request) => {
+			request._nodeResponse.writeHead(200, {
+				'Content-Type': 'text/plain',
+				'X-Harper-Cache': 'HIT',
+				'x-harperdb-cache': 'HIT',
+			});
+			request._nodeResponse.end('body');
+		});
+		await source.get('/page', { requestContext: request });
+		deepStrictEqual(request._nodeResponse.writtenHead.headers, { 'Content-Type': 'text/plain' });
+		strictEqual(request._nodeResponse.getHeader('X-Harper-Cache'), 'MISS');
+		strictEqual(request._nodeResponse.getHeader('X-HarperDB-Cache'), 'MISS');
+	});
+
+	test('strips cache status headers from writeHead headers given after a status message', async () => {
+		const request = sourceRequest((request) => {
+			request._nodeResponse.writeHead(200, 'OK', { 'X-Harper-Cache': 'HIT', 'Content-Type': 'text/plain' });
+			request._nodeResponse.end('body');
+		});
+		await source.get('/page', { requestContext: request });
+		strictEqual(request._nodeResponse.getHeader('X-Harper-Cache'), 'MISS');
 	});
 
 	test('compresses with brotli for a client that accepts it', async () => {

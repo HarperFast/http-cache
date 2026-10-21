@@ -282,7 +282,6 @@ const setCacheSource = (cacheDbNames) => {
 					let encoder;
 					nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
 						for (const name of CACHE_STATUS_HEADERS) nodeResponse.setHeader(name, 'MISS');
-						let headersObject = headers ?? messageOrHeaders;
 						getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
 						// needed
 						if (Array.isArray(messageOrHeaders?.[0])) {
@@ -290,6 +289,12 @@ const setCacheSource = (cacheDbNames) => {
 								acc[key] = value;
 								return acc;
 							}, {});
+						}
+						// headers passed to writeHead override setHeader, so an origin's own cache status must not reach the client
+						if (headers && typeof headers === 'object' && !Array.isArray(headers)) {
+							headers = withoutCacheStatusHeaders(headers);
+						} else if (messageOrHeaders && typeof messageOrHeaders === 'object' && !Array.isArray(messageOrHeaders)) {
+							messageOrHeaders = withoutCacheStatusHeaders(messageOrHeaders);
 						}
 						writeHead.call(nodeResponse, status, messageOrHeaders, headers);
 					};
