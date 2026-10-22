@@ -21,6 +21,13 @@
 		"url": "git+https://github.com/HarperFast/http-cache.git"
 	},
 	"license": "Apache-2.0",
+	"files": [
+		"cacheUtils.js",
+		"config.yaml",
+		"extension.js",
+		"schema.graphql",
+		"test/loadTest.js"
+	],
 	"scripts": {
 		"format": "prettier --write .",
 		"test:unit": "node --test --experimental-test-coverage --test-coverage-include=extension.js --test-coverage-include=cacheUtils.js test/*.test.js",
