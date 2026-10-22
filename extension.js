@@ -1,6 +1,13 @@
 const { Readable } = require('node:stream');
 const { createBrotliCompress, brotliDecompress, constants } = require('zlib');
 const crypto = require('crypto');
+const {
+	CACHE_STATUS_HEADERS,
+	createCacheBlob,
+	cachedHeadersToObject,
+	withoutCacheStatusHeaders,
+	withoutHopByHopHeaders,
+} = require('./cacheUtils.js');
 /**
  * Setup the caching middleware
  */
@@ -15,12 +22,6 @@ const DEFAULT_CLEAR_REST_INTERVAL_MS = 10;
 const DEFAULT_CACHE_DB_NAME = 'cache';
 
 const cachesWithSWR = new Map();
-
-const newBlob = async (content, cacheTable) => {
-	const blob = await createBlob(content);
-	await blob.save(cacheTable);
-	return blob;
-};
 
 const ensureDatabases = async (groups = []) => {
 	logger.info(`Using additional cache database groups: ${groups.join(', ')}`);
@@ -96,17 +97,28 @@ exports.getCacheHandler = function (options) {
 				const clearRestIntervalMs = options.clearRestIntervalMs ?? DEFAULT_CLEAR_REST_INTERVAL_MS;
 				// do this before entering the async function in case it throws
 				const searchResults = cacheTable.search(query, { onlyIfCached: true, noCacheStore: true });
-				let finished, lastKey;
+				let finished, lastKey, failure;
 				(async () => {
-					for await (let entry of searchResults) {
-						lastKey = entry.id;
-						last = cacheTable.delete(entry.id); // no context/transaction, should be non-transactional/incremental
-						if (count++ % clearRestIntervalCount === 0) {
-							await last;
-							if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
+					try {
+						for await (let entry of searchResults) {
+							lastKey = entry.id;
+							last = cacheTable.invalidate(entry.id); // no context/transaction, should be non-transactional/incremental
+							if (count++ % clearRestIntervalCount === 0) {
+								await last;
+								if (clearRestIntervalMs) await new Promise((resolve) => setTimeout(resolve, clearRestIntervalMs));
+							}
 						}
+						// await the final in-flight invalidation so completion isn't reported early
+						await last;
+					} catch (error) {
+						// This IIFE is deliberately not awaited, so without this catch a throw here
+						// would be an unhandled rejection AND would leave `finished` undefined —
+						// the progress generator below would then loop forever, hanging the response.
+						failure = error;
+						logger.error(`Cache invalidation failed after ${count} entries`, error);
+					} finally {
+						finished = true;
 					}
-					finished = true;
 				})();
 				return {
 					status: 200,
@@ -116,6 +128,10 @@ exports.getCacheHandler = function (options) {
 						while (!finished) {
 							yield `Invalidated ${count} entries, last deleted ${lastKey}\n`;
 							await new Promise((resolve) => setTimeout(resolve, 1000));
+						}
+						if (failure) {
+							yield `Cache invalidation failed after ${count} entries: ${failure.message ?? failure}\n`;
+							return;
 						}
 						yield `Cache invalidation complete, deleted ${count} entries\n`;
 					})(),
@@ -176,13 +192,13 @@ exports.getCacheHandler = function (options) {
 			if (!request._nodeResponse.writableEnded) {
 				// but if we have a cache hit, we can return the cached response
 				let ifNoneMatch = request.headers.get('If-None-Match');
-				let headers = response.headers.toJSON();
+				const headers = withoutHopByHopHeaders(withoutCacheStatusHeaders(cachedHeadersToObject(response.headers)));
 				const etag = headers.etag;
 				let status = response.status ?? 200;
 				let body;
 				let age = Math.round((Date.now() - response.getUpdatedTime()) / 1000);
-				headers = { ...headers, 'X-HarperDB-Cache': 'HIT', 'Age': age };
-				delete headers['x-harperdb-cache'];
+				for (const name of CACHE_STATUS_HEADERS) headers[name] = 'HIT';
+				headers['Age'] = age;
 				delete headers['content-length'];
 				if (ifNoneMatch && ifNoneMatch === etag) {
 					status = 304;
@@ -192,17 +208,22 @@ exports.getCacheHandler = function (options) {
 						try {
 							// attempt to convert it from a blob to a buffer
 							body = await body.bytes();
-						} catch (_e) {
+						} catch (blobError) {
+							// The blob is unreadable, so drop the entry and fall through to the origin.
+							// Both failures are logged: `return` inside a `finally` would have silently
+							// swallowed an invalidate() rejection, leaving a poisoned entry with no trace.
+							logger.warn(`Unreadable cache blob for ${cacheKey}; invalidating`, blobError);
 							try {
-								await cacheTable.delete(cacheKey); // if we can't read the blob, delete it from the cache
-							} finally {
-								return nextHandler(request);
+								await cacheTable.invalidate(cacheKey); // if we can't read the blob, invalidate it from the cache
+							} catch (invalidateError) {
+								logger.error(`Failed to invalidate unreadable cache entry ${cacheKey}`, invalidateError);
 							}
+							return nextHandler(request);
 						}
 					}
-					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding').includes('br')) {
+					if (headers['content-encoding'] === 'br' && !request.headers.get('Accept-Encoding')?.includes('br')) {
 						// if the client doesn't support brotli, we need to decompress the response
-						body = await new Promise((resolve) =>
+						body = await new Promise((resolve, reject) =>
 							brotliDecompress(body, (err, result) => {
 								if (err) reject(err);
 								else resolve(result);
@@ -261,8 +282,7 @@ const setCacheSource = (cacheDbNames) => {
 					const writeHead = nodeResponse.writeHead;
 					let encoder;
 					nodeResponse.writeHead = (status, messageOrHeaders, headers) => {
-						nodeResponse.setHeader('X-HarperDB-Cache', 'MISS');
-						let headersObject = headers ?? messageOrHeaders;
+						for (const name of CACHE_STATUS_HEADERS) nodeResponse.setHeader(name, 'MISS');
 						getEncoder(headers?.['content-encoding']); // ensure the encoder is created, and Content-Encoding is set as
 						// needed
 						if (Array.isArray(messageOrHeaders?.[0])) {
@@ -270,6 +290,12 @@ const setCacheSource = (cacheDbNames) => {
 								acc[key] = value;
 								return acc;
 							}, {});
+						}
+						// headers passed to writeHead override setHeader, so an origin's own cache status must not reach the client
+						if (headers && typeof headers === 'object' && !Array.isArray(headers)) {
+							headers = withoutCacheStatusHeaders(headers);
+						} else if (messageOrHeaders && typeof messageOrHeaders === 'object' && !Array.isArray(messageOrHeaders)) {
+							messageOrHeaders = withoutCacheStatusHeaders(messageOrHeaders);
 						}
 						writeHead.call(nodeResponse, status, messageOrHeaders, headers);
 					};
@@ -325,9 +351,7 @@ const setCacheSource = (cacheDbNames) => {
 							blocks.push(block);
 						}
 						endResponse.call(nodeResponse, block);
-						const headers = Object.assign({}, nodeResponse.getHeaders());
-						delete headers['x-harperdb-cache'];
-						delete headers.connection;
+						const headers = withoutHopByHopHeaders(withoutCacheStatusHeaders(nodeResponse.getHeaders()));
 						let etag = headers.etag;
 						if (!etag) headers.etag = Date.now().toString(32);
 						// cache the response, with the headers and content
@@ -336,7 +360,7 @@ const setCacheSource = (cacheDbNames) => {
 							id: path,
 							expiresSWRAt,
 							headers,
-							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content,
+							content: typeof createBlob === 'function' ? await createCacheBlob(content, cacheDB.HttpCache) : content,
 						});
 						let pathStart = request.pathname.match(/^.\w*/)?.[0] ?? request.pathname;
 						server.recordAnalytics(performance.now() - request.startTime, 'http-cache-miss', pathStart);
@@ -351,11 +375,12 @@ const setCacheSource = (cacheDbNames) => {
 							context.noCacheStore = true;
 						}
 						if (block instanceof ReadableStream) {
-							const piped = Readable.fromWeb(block).pipe(encoder);
+							const enc = getEncoder();
+							const piped = Readable.fromWeb(block).pipe(enc);
 							piped.on('finish', () => {
 								resolve({
 									id: path,
-									headers: nodeResponse.getHeaders(),
+									headers: withoutHopByHopHeaders(withoutCacheStatusHeaders(nodeResponse.getHeaders())),
 									//content: blocks.length > 1 ? Buffer.concat(blocks) : blocks[0],
 								});
 							});
@@ -377,12 +402,15 @@ const setCacheSource = (cacheDbNames) => {
 						for (let [key, value] of response.headers) {
 							headersObject[key] = value;
 						}
+						headersObject = withoutHopByHopHeaders(withoutCacheStatusHeaders(headersObject));
 						let cacheControl = response.headers.get('cache-control');
-						exports.parseHeaderValue(cacheControl).forEach((part) => {
-							if (part.name === 'no-store') context.noCacheStore = true;
-							if (part.name === 'no-cache') context.noCache = true;
-							if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
-						});
+						if (cacheControl) {
+							exports.parseHeaderValue(cacheControl).forEach((part) => {
+								if (part.name === 'no-store') context.noCacheStore = true;
+								if (part.name === 'no-cache') context.noCache = true;
+								if (part.name === 'max-age') context.expiresAt = part.value * 1000 + Date.now();
+							});
+						}
 						let etag = response.headers.get('ETag') || response.headers.get('Last-Modified');
 						if (!etag) headersObject.ETag = Date.now().toString(32);
 						// TODO: handle streaming responses
@@ -391,7 +419,7 @@ const setCacheSource = (cacheDbNames) => {
 							id: path,
 							expiresSWRAt,
 							headers: headersObject,
-							content: typeof createBlob === 'function' ? await newBlob(content, cacheDB.HttpCache) : content, // utilize blobs if they are available
+							content: typeof createBlob === 'function' ? await createCacheBlob(content, cacheDB.HttpCache) : content, // utilize blobs if they are available
 						});
 					}
 				});

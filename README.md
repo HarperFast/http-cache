@@ -1,12 +1,12 @@
 # @harperdb/http-cache
 
-A [HarperDB Component](https://docs.harperdb.io/docs/developers/components) for caching HTTP requests/responses from other components.
+A [Harper Component](https://docs.harperdb.io/docs/developers/components) for caching HTTP requests/responses from other components.
 
 ![NPM Version](https://img.shields.io/npm/v/%40harperdb%2Fhttp-cache)
 
 ## Installation
 
-Go into the HarperDB application you would building and install this package and add it to the `config.yaml` file:
+Go into the Harper application you would building and install this package and add it to the `config.yaml` file:
 
 1. Install:
 
@@ -36,6 +36,14 @@ Specify a port for the caching server. Defaults to `9926`.
 - clearRestIntervalMs - Duration of pause in milliseconds when /invalidate endpoint is called
 - scheduledFullCacheClearTime - Time of day to perform a full cache clear (Expressed as hours in 24-hour format UTC time, i.e. 10.33 = 10:20 AM UTC)
 - additionalCacheDatabaseGroups - Array of additional database groups to use for caching. Each group will create a new database to store cached records.
+
+## Compatibility
+
+Works with Harper 4.6+ and Harper 5.
+
+## Cache status headers
+
+Every cached response carries `X-Harper-Cache` with a value of `HIT` or `MISS`. The same value is also sent as `X-HarperDB-Cache`, the legacy name, so existing consumers keep working; new consumers should read `X-Harper-Cache`. Neither header is stored with the cached response.
 
 ## Invalidation
 
